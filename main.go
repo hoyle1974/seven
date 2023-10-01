@@ -14,17 +14,13 @@ import (
 	_ "embed"
 
 	"flag"
-	"math/rand"
 	"net/http"
 	"os"
 	"text/template"
-	"time"
 
 	ginzerolog "github.com/dn365/gin-zerolog"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/hellofresh/health-go/v5"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -34,64 +30,18 @@ import (
 var indexHtml string
 var homeTemplate = template.Must(template.New("").Parse(indexHtml))
 
+//go:embed client.js
+var clientJS string
+var clientTemplate = template.Must(template.New("").Parse(clientJS))
+
 var addr = flag.String("addr", ":8080", "http service address")
 var debug = flag.Bool("debug", true, "Enable debug")
 
 var upgrader = websocket.Upgrader{} // use default option
 
-var cache, _ = lru.New[string, Entry](1024)
-
-type Entry struct {
-	uuid     uuid.UUID
-	address  string
-	lastSeen time.Time
-}
-
-func (e Entry) ToEntryJson() EntryForm {
-	return EntryForm{
-		Uuid:    e.uuid.String(),
-		Address: e.address,
-	}
-}
-
 type EntryForm struct {
 	Uuid    string `form:"uuid" json:"uuid" binding:"required"`
 	Address string `form:"addr" json:"addr" binding:"required"`
-}
-
-func genGoodRandom(max int, bad map[int]bool) int {
-	n := -1
-	maxTries := 5
-	for maxTries > 0 {
-		p := rand.Intn(max)
-		if !bad[p] {
-			n = p
-			break
-		}
-		maxTries--
-	}
-	return n
-}
-
-func pickSome(values []Entry, amount int) []EntryForm {
-	picked := make([]EntryForm, 0)
-	bad := make(map[int]bool, 0)
-
-	if len(values) == 0 {
-		return picked
-	}
-
-	for amount > 0 {
-		idx := genGoodRandom(len(values), bad)
-		if idx == -1 {
-			break
-		}
-		bad[idx] = true
-		picked = append(picked, values[idx].ToEntryJson())
-		amount--
-	}
-
-	return picked
 }
 
 func register(ctx *gin.Context) {
@@ -103,36 +53,17 @@ func register(ctx *gin.Context) {
 		return
 	}
 
-	// Extract and validate uuid
-	uuid, err := uuid.Parse(json.Uuid)
+	entries, err := registerJSON(json)
 	if err != nil {
 		log.Err(err).Msg("Error converting uuid string to actual uuid")
 		ctx.JSON(http.StatusNotAcceptable, gin.H{"status": "not acceptable"})
-		return
-	}
-	if len(json.Address) < 1 {
-		log.Err(err).Msg("Address was empty")
-		ctx.JSON(http.StatusNotAcceptable, gin.H{"status": "not acceptable"})
-		return
+
 	}
 
-	entries := pickSome(cache.Values(), 16)
-
-	entry := Entry{
-		uuid:     uuid,
-		address:  json.Address,
-		lastSeen: time.Now(),
-	}
-
-	// Store this uuid and it's address
-	log.Debug().Str("uuid", json.Uuid).Msg("Registering client")
-	cache.Add(json.Uuid, entry)
-
-	// TODO - get a set of address to return
 	ctx.JSON(http.StatusOK, gin.H{"status": "ok", "entries": entries})
 }
 
-func echo(ctx *gin.Context) {
+func registerWS(ctx *gin.Context) {
 	w, r := ctx.Writer, ctx.Request
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -155,8 +86,37 @@ func echo(ctx *gin.Context) {
 	}
 }
 
+/*
+func echo(ctx *gin.Context) {
+	w, r := ctx.Writer, ctx.Request
+	c, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Error().AnErr("upgrade", err)
+		return
+	}
+	defer c.Close()
+	for {
+		mt, message, err := c.ReadMessage()
+		if err != nil {
+			log.Error().AnErr("read", err)
+			break
+		}
+		log.Printf("recv:%s", message)
+		err = c.WriteMessage(mt, message)
+		if err != nil {
+			log.Error().AnErr("write", err)
+			break
+		}
+	}
+}
+*/
+
 func home(c *gin.Context) {
-	homeTemplate.Execute(c.Writer, "ws://"+c.Request.Host+"/echo")
+	homeTemplate.Execute(c.Writer, "ws://"+c.Request.Host+"/ws/register")
+}
+
+func client(c *gin.Context) {
+	clientTemplate.Execute(c.Writer, "ws://"+c.Request.Host+"/ws/register")
 }
 
 func main() {
@@ -177,8 +137,10 @@ func main() {
 	r.Use(gin.Recovery())
 	r.SetTrustedProxies(nil)
 
-	r.GET("/echo", echo)
+	// r.GET("/echo", echo)
 	r.GET("/", home)
+	r.GET("/client.js", client)
+	r.GET("/ws/register", registerWS)
 	r.POST("/register", register)
 
 	h, _ := health.New(
